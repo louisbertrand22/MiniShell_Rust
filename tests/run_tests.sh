@@ -548,6 +548,41 @@ run_case "a digit not followed by a redirect stays a normal argument" \
     ' 2 3$'
 
 echo
+echo "== Signals =="
+run_case "a command killed by SIGINT sets \$? to 130" \
+    "sh -c 'kill -INT \$\$'
+echo status=\$?" \
+    'status=130' \
+    '! grep -q "Execution Error" <<< "$ACTUAL_OUTPUT"'
+
+run_case "a command killed by SIGQUIT sets \$? to 131 (children don't inherit the shell's ignore)" \
+    "sh -c 'kill -QUIT \$\$'
+echo status=\$?" \
+    'status=131' \
+    'grep -q "signal 3" <<< "$ACTUAL_OUTPUT" && ! grep -q "None" <<< "$ACTUAL_OUTPUT"'
+
+run_case "SIGINT aborts the rest of the current line, but the shell survives" \
+    'kill -INT $$; echo same_line
+echo next_line' \
+    'next_line' \
+    '! grep -q same_line <<< "$ACTUAL_OUTPUT"'
+
+run_case "SIGINT stops a running loop" \
+    'until false; do kill -INT $$; done
+echo loop_stopped' \
+    'loop_stopped'
+
+run_case "\$? is 130 after an interrupted line" \
+    'kill -INT $$; echo unreachable
+echo status=$?' \
+    'status=130'
+
+run_case "the shell ignores SIGQUIT" \
+    'kill -QUIT $$
+echo survived_quit' \
+    'survived_quit'
+
+echo
 echo "-----------------------------------"
 echo "Results: ${GREEN}${PASS} passed${NC}, ${RED}${FAIL} failed${NC}"
 

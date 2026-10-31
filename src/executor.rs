@@ -1,3 +1,4 @@
+use crate::signals;
 use crate::parser::ast::{Command, LogicalOp, ParamOp, Redirect, RedirectKind, Word};
 use std::fs::OpenOptions;
 use std::io::{self, Seek, SeekFrom, Write};
@@ -73,7 +74,7 @@ struct PreparedRedirects {
 pub struct Executor;
 
 impl Executor {
-    fn set_last_status(code: i32) {
+    pub fn set_last_status(code: i32) {
         LAST_STATUS.store(code, Ordering::Relaxed);
     }
 
@@ -124,7 +125,33 @@ impl Executor {
         }
     }
 
+    /// Code de sortie façon shell: le code du process, ou 128 + numéro du
+    /// signal qui l'a tué (130 pour SIGINT, 131 pour SIGQUIT, ...).
+    fn status_code(status: ExitStatus) -> i32 {
+        status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+    }
+
+    /// Traduit le statut d'une commande en résultat. Une mort par SIGINT est
+    /// silencieuse (l'utilisateur vient de taper Ctrl-C, comme dans bash).
+    fn status_result(status: ExitStatus) -> Result<(), String> {
+        match (status.code(), status.signal()) {
+            _ if status.success() => Ok(()),
+            (Some(code), _) => Err(format!("Command exited with non-zero status: {code}")),
+            (None, Some(libc::SIGINT)) => Err(String::new()),
+            (None, Some(signal)) => Err(format!("Command terminated by signal {signal}")),
+            (None, None) => Err("Command terminated abnormally".to_string()),
+        }
+    }
+
     pub fn execute(command: Command) -> Result<(), String> {
+        // Après un Ctrl-C, plus rien de la ligne en cours ne s'exécute.
+        if signals::interrupted() {
+            Self::set_last_status(130);
+            return Err(String::new());
+        }
+
         match command {
             Command::Simple(simple_cmd) => {
                 let name = Self::expand(&simple_cmd.name);
@@ -144,7 +171,7 @@ impl Executor {
 
                 let mut command = SysCommand::new(&name);
                 command.args(&args);
-                Self::install_redirects(&mut command, &prepared);
+                Self::prepare_child(&mut command, &prepared);
 
                 let mut child = match command.spawn() {
                     Ok(child) => child,
@@ -164,13 +191,9 @@ impl Executor {
                 let status = child
                     .wait()
                     .map_err(|e| format!("Failed to wait for command: {}", e))?;
-                Self::set_last_status(status.code().unwrap_or(1));
+                Self::set_last_status(Self::status_code(status));
 
-                if status.success() {
-                    Ok(())
-                } else {
-                    Err(format!("Command exited with non-zero status: {:?}", status.code()))
-                }
+                Self::status_result(status)
             }
             Command::BinaryOp { left, op, right } => {
                 let left_res = Self::execute(*left);
@@ -225,6 +248,9 @@ impl Executor {
         let mut last_result = Ok(());
 
         loop {
+            if signals::interrupted() {
+                return Err(String::new());
+            }
             let condition_ok = Self::execute(condition.clone()).is_ok();
             let should_continue = if until { !condition_ok } else { condition_ok };
             if !should_continue {
@@ -240,6 +266,9 @@ impl Executor {
         let mut last_result = Ok(());
 
         for word in words {
+            if signals::interrupted() {
+                return Err(String::new());
+            }
             let value = Self::expand(&word);
             // Exposée comme variable d'environnement: c'est ce qui permet à `$var`
             // (une autre `Word::Variable`) de la relire dans le corps de la boucle.
@@ -297,6 +326,7 @@ impl Executor {
         }
 
         // Process enfant: à partir d'ici on ne revient jamais dans execute_pipeline.
+        signals::reset_for_child();
         if let Some(fd) = stdin_fd {
             unsafe {
                 libc::dup2(fd, 0);
@@ -379,7 +409,7 @@ impl Executor {
                 // explicites de l'étage passent par-dessus.
                 let mut command = SysCommand::new(&name);
                 command.args(&args).stdin(stdin).stdout(stdout);
-                Self::install_redirects(&mut command, &prepared);
+                Self::prepare_child(&mut command, &prepared);
 
                 let child = command
                     .spawn()
@@ -397,14 +427,10 @@ impl Executor {
         }
 
         if let Some(status) = &last_status {
-            Self::set_last_status(status.code().unwrap_or(1));
+            Self::set_last_status(Self::status_code(*status));
         }
 
-        match last_status {
-            Some(status) if status.success() => Ok(()),
-            Some(status) => Err(format!("Command exited with non-zero status: {:?}", status.code())),
-            None => Ok(()),
-        }
+        last_status.map_or(Ok(()), Self::status_result)
     }
 
     /// Lance le builtin `name` dans le process courant, qui doit déjà avoir
@@ -598,16 +624,16 @@ impl Executor {
         Ok(())
     }
 
-    /// Fait appliquer les redirections par l'enfant juste avant son exec
-    /// (après le branchement des pipes stdin/stdout fait par `Command`).
-    fn install_redirects(command: &mut SysCommand, prepared: &PreparedRedirects) {
-        if prepared.actions.is_empty() {
-            return;
-        }
+    /// Prépare l'enfant juste avant son exec (après le branchement des pipes
+    /// stdin/stdout fait par `Command`): signaux par défaut, puis redirections.
+    fn prepare_child(command: &mut SysCommand, prepared: &PreparedRedirects) {
         let actions = prepared.actions.clone();
-        // Safe: la closure ne fait que des dup2/close/fcntl, async-signal-safe.
+        // Safe: la closure ne fait que signal/dup2/close/fcntl, async-signal-safe.
         unsafe {
-            command.pre_exec(move || Self::apply_fd_actions(&actions));
+            command.pre_exec(move || {
+                signals::reset_for_child();
+                Self::apply_fd_actions(&actions)
+            });
         }
     }
 

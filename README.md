@@ -5,7 +5,8 @@ A small Unix shell implemented in Rust, inspired by the 42 School `minishell` pr
 ## Features
 
 ### Working
-- Interactive REPL (prompt, read, execute, loop; exits cleanly on `Ctrl-D`)
+- Interactive REPL (prompt, read, execute, loop; exits cleanly on `Ctrl-D`). On a terminal, line editing and history come from [rustyline](https://crates.io/crates/rustyline): arrow keys, `Ctrl-R` search, and a history persisted in `~/.minishell_history`; heredoc bodies get a `> ` continuation prompt. When stdin is not a terminal (pipe, script, tests), lines are read raw from stdin instead.
+- Signals, like an interactive bash: `Ctrl-\` (SIGQUIT) is ignored by the shell; `Ctrl-C` (SIGINT) never kills the shell — at the prompt it drops the current input, during execution it kills the foreground command and abandons the rest of the line (remaining `;` commands, loops), and inside a heredoc it cancels the whole line. Commands started by the shell get the default SIGINT/SIGQUIT behavior back. A command killed by a signal sets `$?` to 128 + the signal number (130 for `Ctrl-C`).
 - Lexer: words, single-quoted strings (`'...'`, never expanded), double-quoted strings (`"..."`, `$VAR` still expands inside, `\"`/`\\`/`\$` are recognized escapes), variables (`$VAR`), keywords (`if`/`then`/`elif`/`else`/`fi`, `while`/`until`/`do`/`done`, `for`/`in`) — only recognized when unquoted, logical operators (`&&`, `||`), pipe (`|`), separators (`;`, newline), redirection operators (`>`, `>>`, `>&`, `>|`, `<`, `<&`, `<>`), parentheses, and braces. Adjacent bare/quoted/variable segments with no whitespace between them (e.g. `pre"mid"$VARpost`) are lexed as a single word.
 - Parser: simple commands, redirections (`>`, `>|`, `>>`, `<`, `<>`, `>&N`/`<&N`, `>&-`/`<&-`, heredocs `<<`/`<<-`, each optionally prefixed by a file descriptor number like `2>` or `3<`, in any position among the words), pipelines (`|`), `&&` / `||` chains, command lists separated by `;` (on the main line and inside every `if`/`while`/`until`/`for` condition or body; `&&`/`||` bind tighter than `;`, and a trailing `;` is fine), `if` / `elif` / `else` / `fi`, `while` / `until` / `do` / `done`, `for VAR in words... do ... done`. Command names, arguments, and redirection targets can each be a literal word, a single-quoted string, or a `$VAR` reference.
 - Parse errors: anything left on the line that the grammar can't place (e.g. a stray `)`) is reported as a `Parse Error` and nothing on that line runs, instead of being silently dropped.
@@ -27,7 +28,8 @@ A small Unix shell implemented in Rust, inspired by the 42 School `minishell` pr
 
 ```
 src/
-├── main.rs           # REPL: prompt, read line, lex, parse, execute
+├── main.rs           # REPL: prompt/line editing, read line, lex, parse, execute
+├── signals.rs        # SIGINT/SIGQUIT dispositions and the "interrupted" flag
 ├── lexer/
 │   ├── lexer.rs       # Lexer: turns input text into a stream of tokens
 │   ├── token.rs       # Token and WordPart enums
@@ -71,4 +73,4 @@ A black-box test suite lives in `tests/run_tests.sh`. It builds the project, the
 bash tests/run_tests.sh
 ```
 
-It covers simple commands, `&&`/`||`, `;` lists, pipelines, redirections (`>`, `>>`, `<`, `>|`, `<>`, `2>`, `2>&1`, `>&2`, `<&3`, `2>&-`), heredocs (`<<`, `<<-`, quoted delimiters), `if`/`elif`/`else`, `while`/`until`, `for`, variable expansion, double quotes and word concatenation, builtins (standalone and as forked pipeline stages), lexer punctuation/escaping, and parameter expansion (`${VAR}`, `:-`/`:=`/`:+`, `$?`, `$$`).
+It covers simple commands, `&&`/`||`, `;` lists, signals (SIGINT/SIGQUIT handling, 128+n exit statuses), pipelines, redirections (`>`, `>>`, `<`, `>|`, `<>`, `2>`, `2>&1`, `>&2`, `<&3`, `2>&-`), heredocs (`<<`, `<<-`, quoted delimiters), `if`/`elif`/`else`, `while`/`until`, `for`, variable expansion, double quotes and word concatenation, builtins (standalone and as forked pipeline stages), lexer punctuation/escaping, and parameter expansion (`${VAR}`, `:-`/`:=`/`:+`, `$?`, `$$`).
