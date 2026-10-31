@@ -1,10 +1,10 @@
-use crate::parser::ast::{Command, LogicalOp, ParamOp, Redirect, Word};
-use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::io::{FromRawFd, RawFd};
-use std::os::unix::process::ExitStatusExt;
+use crate::parser::ast::{Command, LogicalOp, ParamOp, Redirect, RedirectKind, Word};
+use std::fs::OpenOptions;
+use std::io::{self, Seek, SeekFrom, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command as SysCommand, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 /// Code de sortie de la dernière commande exécutée, exposé via `$?`.
 static LAST_STATUS: AtomicI32 = AtomicI32::new(0);
@@ -37,6 +37,37 @@ impl PipelineChild {
             }
         }
     }
+}
+
+/// Plus petit fd utilisé pour les fichiers ouverts par les redirections et
+/// les sauvegardes de fds: les garder hors de 0..=9 évite qu'un `dup2` sur un
+/// fd cible écrase un fichier qu'une action suivante doit encore lire
+/// (ex. `4>a 3>b`, où `a` aurait sinon pu être ouvert sur le fd 4).
+const HIGH_FD: RawFd = 10;
+
+/// Une étape de redirection, appliquée dans l'ordre d'écriture: l'ordre compte
+/// (`>f 2>&1` envoie les deux flux dans `f`, `2>&1 >f` seulement stdout).
+#[derive(Debug, Clone, Copy)]
+enum FdAction {
+    /// `dup2(src, target)`
+    Dup { src: RawFd, target: RawFd },
+    /// `close(target)`
+    Close(RawFd),
+}
+
+impl FdAction {
+    fn target(self) -> RawFd {
+        match self {
+            FdAction::Dup { target, .. } | FdAction::Close(target) => target,
+        }
+    }
+}
+
+/// Redirections résolues: fichiers ouverts (gardés vivants jusqu'à ce que
+/// l'enfant les ait récupérés) et actions à appliquer sur les fds.
+struct PreparedRedirects {
+    actions: Vec<FdAction>,
+    _files: Vec<OwnedFd>,
 }
 
 pub struct Executor;
@@ -98,22 +129,37 @@ impl Executor {
             Command::Simple(simple_cmd) => {
                 let name = Self::expand(&simple_cmd.name);
                 let args: Vec<String> = simple_cmd.args.iter().map(Self::expand).collect();
+                let prepared = Self::prepare_redirects(&simple_cmd.redirects).inspect_err(|_| Self::set_last_status(1))?;
 
-                if let Some(result) = Self::run_builtin(&name, &args, &simple_cmd.redirects) {
+                if Self::is_builtin(&name) {
+                    // L'erreur est affichée tant que les redirections sont actives,
+                    // pour que `cd nowhere 2>/dev/null` reste silencieux.
+                    let result = Self::with_redirects_in_shell(&prepared, || {
+                        Self::run_builtin(&name, &args).inspect_err(|e| Self::report_error(e))
+                    })
+                    .inspect_err(|_| Self::set_last_status(1))?;
                     Self::set_last_status(if result.is_ok() { 0 } else { 1 });
-                    return result;
+                    return result.map_err(|_| String::new());
                 }
 
-                let (stdin, stdout) =
-                    Self::apply_redirects(&simple_cmd.redirects, Stdio::inherit(), Stdio::inherit())?;
+                let mut command = SysCommand::new(&name);
+                command.args(&args);
+                Self::install_redirects(&mut command, &prepared);
 
-                let mut child = match SysCommand::new(&name).args(&args).stdin(stdin).stdout(stdout).spawn() {
+                let mut child = match command.spawn() {
                     Ok(child) => child,
                     Err(e) => {
                         Self::set_last_status(127);
-                        return Err(format!("Failed to start command '{}': {}", name, e));
+                        let message = format!("Failed to start command '{}': {}", name, e);
+                        // Comme un vrai shell, le message suit les redirections de la
+                        // commande (`cmd_inconnue 2>/dev/null` n'affiche rien).
+                        if Self::with_redirects_in_shell(&prepared, || Self::report_error(&message)).is_err() {
+                            Self::report_error(&message);
+                        }
+                        return Err(String::new());
                     }
                 };
+                drop(prepared); // l'enfant a ses copies: on libère les nôtres
 
                 let status = child
                     .wait()
@@ -154,6 +200,20 @@ impl Executor {
                 } else {
                     Ok(())
                 }
+            }
+            Command::Sequence(commands) => {
+                let mut last_result: Result<(), String> = Ok(());
+                for command in commands {
+                    // Une commande qui échoue n'arrête pas la liste: son erreur est
+                    // affichée tout de suite, seule celle de la dernière remonte.
+                    if let Err(e) = &last_result
+                        && !e.is_empty()
+                    {
+                        Self::report_error(e);
+                    }
+                    last_result = Self::execute(command);
+                }
+                last_result
             }
             Command::Pipeline(commands) => Self::execute_pipeline(commands),
             Command::Loop { condition, body, until } => Self::execute_loop(*condition, *body, until),
@@ -216,12 +276,13 @@ impl Executor {
     }
 
     /// Exécute un builtin comme étage de pipeline en le forkant: l'enfant
-    /// branche `stdin_fd`/`stdout_fd` sur ses fds 0/1 puis lance le builtin
-    /// directement (sans exec), avant de quitter avec son code de sortie.
+    /// branche `stdin_fd`/`stdout_fd` sur ses fds 0/1, applique ses propres
+    /// redirections, puis lance le builtin directement (sans exec), avant de
+    /// quitter avec son code de sortie.
     fn fork_builtin(
-        name: String,
-        args: Vec<String>,
-        redirects: Vec<Redirect>,
+        name: &str,
+        args: &[String],
+        prepared: &PreparedRedirects,
         stdin_fd: Option<RawFd>,
         stdout_fd: Option<RawFd>,
     ) -> Result<libc::pid_t, String> {
@@ -249,13 +310,18 @@ impl Executor {
             }
         }
 
-        let code = match Self::run_builtin(&name, &args, &redirects) {
-            Some(Ok(())) => 0,
-            Some(Err(e)) => {
-                eprintln!("{}", e);
+        let code = match Self::apply_fd_actions(&prepared.actions) {
+            Err(e) => {
+                Self::report_error(&format!("{}: {}", name, e));
                 1
             }
-            None => unreachable!("fork_builtin appelé avec un nom qui n'est pas un builtin"),
+            Ok(()) => match Self::run_builtin(name, args) {
+                Ok(()) => 0,
+                Err(e) => {
+                    Self::report_error(&e);
+                    1
+                }
+            },
         };
 
         io::stdout().flush().ok();
@@ -276,6 +342,8 @@ impl Executor {
             let name = Self::expand(&simple_cmd.name);
             let args: Vec<String> = simple_cmd.args.iter().map(Self::expand).collect();
 
+            let prepared = Self::prepare_redirects(&simple_cmd.redirects)?;
+
             let (next_read, write_end) = if i + 1 < count {
                 let (r, w) = Self::create_pipe()?;
                 (Some(r), Some(w))
@@ -284,7 +352,7 @@ impl Executor {
             };
 
             if Self::is_builtin(&name) {
-                let pid = Self::fork_builtin(name, args, simple_cmd.redirects, prev_read, write_end)?;
+                let pid = Self::fork_builtin(&name, &args, &prepared, prev_read, write_end)?;
                 children.push(PipelineChild::Forked(pid));
 
                 // Le parent n'a plus besoin de ses copies: l'enfant en a fait les
@@ -305,15 +373,15 @@ impl Executor {
                     Some(fd) => unsafe { Stdio::from_raw_fd(fd) },
                     None => Stdio::inherit(),
                 };
-                // Stdio::from_raw_fd possède le fd: qu'il soit consommé par spawn()
-                // ou remplacé ici par apply_redirects, il se ferme tout seul côté
-                // parent dès qu'il est droppé — aucune fermeture manuelle requise.
-                let (stdin, stdout) = Self::apply_redirects(&simple_cmd.redirects, stdin, stdout)?;
+                // Stdio::from_raw_fd possède le fd: consommé par spawn(), il se
+                // ferme tout seul côté parent — aucune fermeture manuelle requise.
+                // Les pipes sont branchés avant pre_exec, donc les redirections
+                // explicites de l'étage passent par-dessus.
+                let mut command = SysCommand::new(&name);
+                command.args(&args).stdin(stdin).stdout(stdout);
+                Self::install_redirects(&mut command, &prepared);
 
-                let child = SysCommand::new(&name)
-                    .args(&args)
-                    .stdin(stdin)
-                    .stdout(stdout)
+                let child = command
                     .spawn()
                     .map_err(|e| format!("Failed to start command '{}': {}", name, e))?;
 
@@ -339,52 +407,26 @@ impl Executor {
         }
     }
 
-    /// Renvoie `Some(résultat)` si `name` est un builtin (exécuté directement dans
-    /// le process du shell), ou `None` si ce n'est pas un builtin et doit être
-    /// lancé comme un process externe.
-    fn run_builtin(name: &str, args: &[String], redirects: &[Redirect]) -> Option<Result<(), String>> {
+    /// Lance le builtin `name` dans le process courant, qui doit déjà avoir
+    /// ses redirections appliquées (sortie sur stdout, erreurs renvoyées).
+    fn run_builtin(name: &str, args: &[String]) -> Result<(), String> {
         match name {
-            "cd" => Some(Self::builtin_cd(args, redirects)),
-            "pwd" => Some(Self::builtin_pwd(redirects)),
-            "export" => Some(Self::builtin_export(args, redirects)),
-            "unset" => Some(Self::builtin_unset(args, redirects)),
-            "exit" => Some(Self::builtin_exit(args)),
-            _ => None,
+            "cd" => Self::builtin_cd(args),
+            "pwd" => Self::builtin_pwd(),
+            "export" => Self::builtin_export(args),
+            "unset" => Self::builtin_unset(args),
+            "exit" => Self::builtin_exit(args),
+            _ => unreachable!("run_builtin appelé avec un nom qui n'est pas un builtin: {}", name),
         }
     }
 
-    /// Ouvre la cible d'une éventuelle redirection de sortie (`>`/`>>`, la dernière
-    /// gagnant), ou stdout par défaut. Les builtins qui produisent du texte (pwd,
-    /// export) écrivent à travers ce writer plutôt que via `println!` en dur.
-    fn resolve_output_target(redirects: &[Redirect]) -> Result<Box<dyn Write>, String> {
-        let mut target: Option<Box<dyn Write>> = None;
-
-        for redirect in redirects {
-            match redirect {
-                Redirect::Output(word) => {
-                    let path = Self::expand(word);
-                    let file = File::create(&path).map_err(|e| format!("{}: {}", path, e))?;
-                    target = Some(Box::new(file));
-                }
-                Redirect::Append(word) => {
-                    let path = Self::expand(word);
-                    let file = OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&path)
-                        .map_err(|e| format!("{}: {}", path, e))?;
-                    target = Some(Box::new(file));
-                }
-                Redirect::Input(_) => {} // sans effet pour ces builtins, qui ne lisent pas stdin
-            }
-        }
-
-        Ok(target.unwrap_or_else(|| Box::new(io::stdout())))
+    /// Affiche une erreur sur stderr (tel qu'il est au moment de l'appel, donc
+    /// en suivant d'éventuelles redirections actives).
+    fn report_error(message: &str) {
+        eprintln!("Execution Error: {}", message);
     }
 
-    fn builtin_cd(args: &[String], redirects: &[Redirect]) -> Result<(), String> {
-        Self::resolve_output_target(redirects)?; // ouvre/tronque une éventuelle cible, comme un vrai shell
-
+    fn builtin_cd(args: &[String]) -> Result<(), String> {
         let target = match args.first() {
             Some(path) => path.clone(),
             None => std::env::var("HOME").map_err(|_| "cd: HOME not set".to_string())?,
@@ -393,25 +435,22 @@ impl Executor {
         std::env::set_current_dir(&target).map_err(|e| format!("cd: {}: {}", target, e))
     }
 
-    fn builtin_pwd(redirects: &[Redirect]) -> Result<(), String> {
+    fn builtin_pwd() -> Result<(), String> {
         let cwd = std::env::current_dir().map_err(|e| format!("pwd: {}", e))?;
-        let mut out = Self::resolve_output_target(redirects)?;
-        writeln!(out, "{}", cwd.display()).map_err(|e| format!("pwd: {}", e))
+        writeln!(io::stdout(), "{}", cwd.display()).map_err(|e| format!("pwd: {}", e))
     }
 
-    fn builtin_export(args: &[String], redirects: &[Redirect]) -> Result<(), String> {
+    fn builtin_export(args: &[String]) -> Result<(), String> {
         if args.is_empty() {
             let mut vars: Vec<(String, String)> = std::env::vars().collect();
             vars.sort_by(|a, b| a.0.cmp(&b.0));
 
-            let mut out = Self::resolve_output_target(redirects)?;
+            let mut out = io::stdout().lock();
             for (key, value) in vars {
                 writeln!(out, "export {}={}", key, value).map_err(|e| format!("export: {}", e))?;
             }
             return Ok(());
         }
-
-        Self::resolve_output_target(redirects)?;
 
         for arg in args {
             match arg.split_once('=') {
@@ -428,9 +467,7 @@ impl Executor {
         Ok(())
     }
 
-    fn builtin_unset(args: &[String], redirects: &[Redirect]) -> Result<(), String> {
-        Self::resolve_output_target(redirects)?;
-
+    fn builtin_unset(args: &[String]) -> Result<(), String> {
         for arg in args {
             // Safe: ce shell est mono-thread, aucun autre code ne lit/écrit l'environnement en parallèle.
             unsafe { std::env::remove_var(arg) };
@@ -455,40 +492,163 @@ impl Executor {
         std::process::exit(code);
     }
 
-    /// Applique les redirections sur des Stdio de base (héritées ou issues d'un pipe).
-    /// Une redirection explicite prend toujours le pas sur le comportement par défaut,
-    /// et la dernière redirection d'un même type gagne (comme dans un vrai shell).
-    fn apply_redirects(
-        redirects: &[Redirect],
-        mut stdin: Stdio,
-        mut stdout: Stdio,
-    ) -> Result<(Stdio, Stdio), String> {
+    /// Déplace un fd fraîchement ouvert vers un numéro >= `HIGH_FD` (avec
+    /// `FD_CLOEXEC`), pour qu'aucun `dup2` vers une cible basse ne l'écrase.
+    fn move_high(fd: OwnedFd) -> Result<OwnedFd, String> {
+        let high = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, HIGH_FD) };
+        if high < 0 {
+            return Err(format!("fcntl: {}", io::Error::last_os_error()));
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(high) })
+    }
+
+    fn open_file(path: &str, options: &OpenOptions) -> Result<OwnedFd, String> {
+        let file = options.open(path).map_err(|e| format!("{}: {}", path, e))?;
+        Self::move_high(file.into())
+    }
+
+    /// Écrit le corps d'un heredoc dans un fichier temporaire déjà supprimé
+    /// (il vit tant qu'un fd pointe dessus), rembobiné, prêt à être lu.
+    /// Contrairement à un pipe, aucun risque de blocage sur un gros corps.
+    fn heredoc_fd(body: &str) -> Result<OwnedFd, String> {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "minishell-heredoc-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let to_err = |e: io::Error| format!("heredoc: {}", e);
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(to_err)?;
+        std::fs::remove_file(&path).ok();
+        file.write_all(body.as_bytes()).map_err(to_err)?;
+        file.seek(SeekFrom::Start(0)).map_err(to_err)?;
+        Self::move_high(file.into())
+    }
+
+    /// Résout les redirections dans le shell (expansion des cibles, ouverture
+    /// des fichiers), pour que les erreurs (fichier introuvable, ...) soient
+    /// signalées avant tout fork/spawn.
+    fn prepare_redirects(redirects: &[Redirect]) -> Result<PreparedRedirects, String> {
+        let mut actions = Vec::new();
+        let mut files = Vec::new();
+
         for redirect in redirects {
-            match redirect {
-                Redirect::Output(word) => {
-                    let path = Self::expand(word);
-                    let file = File::create(&path)
-                        .map_err(|e| format!("{}: {}", path, e))?;
-                    stdout = Stdio::from(file);
+            let target = redirect.fd;
+            let opened = match &redirect.kind {
+                RedirectKind::Output(word) => {
+                    Self::open_file(&Self::expand(word), OpenOptions::new().write(true).create(true).truncate(true))?
                 }
-                Redirect::Append(word) => {
-                    let path = Self::expand(word);
-                    let file = OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&path)
-                        .map_err(|e| format!("{}: {}", path, e))?;
-                    stdout = Stdio::from(file);
+                RedirectKind::Append(word) => {
+                    Self::open_file(&Self::expand(word), OpenOptions::new().create(true).append(true))?
                 }
-                Redirect::Input(word) => {
-                    let path = Self::expand(word);
-                    let file = File::open(&path)
-                        .map_err(|e| format!("{}: {}", path, e))?;
-                    stdin = Stdio::from(file);
+                RedirectKind::Input(word) => Self::open_file(&Self::expand(word), OpenOptions::new().read(true))?,
+                RedirectKind::ReadWrite(word) => {
+                    Self::open_file(&Self::expand(word), OpenOptions::new().read(true).write(true).create(true))?
+                }
+                RedirectKind::Heredoc(body) => Self::heredoc_fd(&Self::expand(body))?,
+                RedirectKind::Dup(word) => {
+                    let source = Self::expand(word);
+                    if source == "-" {
+                        actions.push(FdAction::Close(target));
+                    } else {
+                        let src = source
+                            .parse::<RawFd>()
+                            .map_err(|_| format!("{}: ambiguous redirect", source))?;
+                        actions.push(FdAction::Dup { src, target });
+                    }
+                    continue;
+                }
+            };
+            actions.push(FdAction::Dup { src: opened.as_raw_fd(), target });
+            files.push(opened);
+        }
+
+        Ok(PreparedRedirects { actions, _files: files })
+    }
+
+    /// Applique les actions sur les fds du process courant, dans l'ordre.
+    /// N'utilise que des appels async-signal-safe: appelable depuis `pre_exec`.
+    fn apply_fd_actions(actions: &[FdAction]) -> io::Result<()> {
+        for action in actions {
+            match *action {
+                FdAction::Dup { src, target } if src == target => {
+                    // dup2 sur lui-même est un no-op qui garderait FD_CLOEXEC:
+                    // il faut le retirer à la main pour que le fd survive à l'exec.
+                    let flags = unsafe { libc::fcntl(src, libc::F_GETFD) };
+                    if flags < 0 || unsafe { libc::fcntl(src, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                FdAction::Dup { src, target } => {
+                    if unsafe { libc::dup2(src, target) } < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                FdAction::Close(target) => unsafe {
+                    libc::close(target);
+                },
+            }
+        }
+        Ok(())
+    }
+
+    /// Fait appliquer les redirections par l'enfant juste avant son exec
+    /// (après le branchement des pipes stdin/stdout fait par `Command`).
+    fn install_redirects(command: &mut SysCommand, prepared: &PreparedRedirects) {
+        if prepared.actions.is_empty() {
+            return;
+        }
+        let actions = prepared.actions.clone();
+        // Safe: la closure ne fait que des dup2/close/fcntl, async-signal-safe.
+        unsafe {
+            command.pre_exec(move || Self::apply_fd_actions(&actions));
+        }
+    }
+
+    /// Exécute `f` dans le shell lui-même avec les redirections appliquées,
+    /// puis remet chaque fd touché dans son état d'origine (sauvegardé sur un
+    /// fd haut, ou refermé s'il n'était pas ouvert). Utilisé pour les builtins,
+    /// qui doivent tourner dans le shell pour affecter son état.
+    fn with_redirects_in_shell<T>(prepared: &PreparedRedirects, f: impl FnOnce() -> T) -> Result<T, String> {
+        if prepared.actions.is_empty() {
+            return Ok(f());
+        }
+
+        let mut saved: Vec<(RawFd, Option<RawFd>)> = Vec::new();
+        for action in &prepared.actions {
+            let target = action.target();
+            if !saved.iter().any(|(fd, _)| *fd == target) {
+                let copy = unsafe { libc::fcntl(target, libc::F_DUPFD_CLOEXEC, HIGH_FD) };
+                saved.push((target, (copy >= 0).then_some(copy)));
+            }
+        }
+
+        io::stdout().flush().ok();
+        let applied = Self::apply_fd_actions(&prepared.actions);
+        let result = applied.is_ok().then(f);
+        io::stdout().flush().ok(); // vide le buffer vers la cible redirigée avant de restaurer
+
+        for (target, copy) in saved.into_iter().rev() {
+            unsafe {
+                match copy {
+                    Some(copy) => {
+                        libc::dup2(copy, target);
+                        libc::close(copy);
+                    }
+                    None => {
+                        libc::close(target);
+                    }
                 }
             }
         }
 
-        Ok((stdin, stdout))
+        applied.map_err(|e| e.to_string())?;
+        Ok(result.expect("f runs whenever the redirections applied"))
     }
 }

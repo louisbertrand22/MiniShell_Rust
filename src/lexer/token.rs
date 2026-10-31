@@ -25,13 +25,19 @@ pub enum Token {
 
     Assign,
 
-    RedirectOut,
-    RedirectIn,
-    RedirectAppend,
-    RedirectOutErr,
-    RedirectInErr,
-    RedirectClobber,
-    RedirectInOut,
+    /// Numéro de fd collé juste devant un opérateur de redirection
+    /// (le `2` de `2>file`, le `3` de `3<&0`, ...).
+    IoNumber(i32),
+
+    RedirectOut,     // >
+    RedirectIn,      // <
+    RedirectAppend,  // >>
+    RedirectDupOut,  // >&
+    RedirectDupIn,   // <&
+    RedirectClobber, // >|
+    RedirectInOut,   // <>
+    Heredoc,         // <<
+    HeredocStrip,    // <<-
 
     ParOpen,
     ParClose,

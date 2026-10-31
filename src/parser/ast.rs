@@ -1,6 +1,9 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Simple(SimpleCommand),
+    /// `cmd1; cmd2; ...`: exécutées l'une après l'autre, quel que soit leur
+    /// résultat; le statut de la liste est celui de la dernière.
+    Sequence(Vec<Command>),
     Pipeline(Vec<Command>),
     BinaryOp {
         left: Box<Command>,
@@ -68,9 +71,27 @@ pub enum ParamOp {
     UseAlternative,
 }
 
+/// Une redirection appliquée au fd `fd` (0 pour les formes d'entrée, 1 pour
+/// les formes de sortie, sauf numéro explicite comme dans `2>file`).
 #[derive(Debug, Clone, PartialEq)]
-pub enum Redirect {
+pub struct Redirect {
+    pub fd: i32,
+    pub kind: RedirectKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RedirectKind {
+    /// `>` et `>|` (pas d'option noclobber dans ce shell, donc identiques).
     Output(Word),
-    Input(Word),
+    /// `>>`
     Append(Word),
+    /// `<`
+    Input(Word),
+    /// `<>`: ouvre le fichier en lecture/écriture, sans le tronquer.
+    ReadWrite(Word),
+    /// `>&N` / `<&N` (duplique le fd N) ou `>&-` / `<&-` (ferme le fd).
+    Dup(Word),
+    /// `<<` / `<<-`: le corps du heredoc, déjà lu. Un `Word` pour que `$VAR`
+    /// y soit développé à l'exécution (sauf délimiteur quoté: tout littéral).
+    Heredoc(Word),
 }

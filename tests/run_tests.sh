@@ -373,6 +373,181 @@ run_case "\$\$ expands to the shell's own pid" \
     ' [0-9]+$'
 
 echo
+echo "== Command lists (;) =="
+run_case "; runs both commands on one line" \
+    'echo first_cmd; echo second_cmd' \
+    'first_cmd' \
+    'grep -q second_cmd <<< "$ACTUAL_OUTPUT"'
+
+run_case "; runs the next command even if the previous one failed" \
+    'false; echo still_runs' \
+    'still_runs'
+
+run_case "a trailing ; is accepted" \
+    'echo trailing;' \
+    'trailing' \
+    '! grep -q Error <<< "$ACTUAL_OUTPUT"'
+
+run_case "\$? after a list reflects its last command" \
+    'true; false
+echo status=$?' \
+    'status=1'
+
+run_case "if bodies can hold several commands" \
+    'if true; then echo body_a; echo body_b; fi' \
+    'body_a' \
+    'grep -q body_b <<< "$ACTUAL_OUTPUT" && ! grep -q Error <<< "$ACTUAL_OUTPUT"'
+
+run_case "an if condition can be a list (its last command decides)" \
+    'if false; true; then echo cond_ok; fi' \
+    'cond_ok'
+
+run_case "loop bodies can hold several commands" \
+    'for x in 1 2; do echo loop_a; echo loop_b; done' \
+    '' \
+    '[[ $(grep -c loop_a <<< "$ACTUAL_OUTPUT") -eq 2 && $(grep -c loop_b <<< "$ACTUAL_OUTPUT") -eq 2 ]]'
+
+run_case "&& binds tighter than ;" \
+    'false && echo skipped; echo after_and' \
+    'after_and' \
+    '! grep -q skipped <<< "$ACTUAL_OUTPUT"'
+
+run_case "two heredocs on separate commands of one line are read in order" \
+    'cat << A; cat << B
+first
+A
+second
+B' \
+    'first' \
+    'grep -q second <<< "$ACTUAL_OUTPUT" && ! grep -q Error <<< "$ACTUAL_OUTPUT"'
+
+run_case "leftover tokens are a parse error, not silently ignored" \
+    'echo visible )' \
+    'Parse Error' \
+    '! grep -q visible <<< "$ACTUAL_OUTPUT"'
+
+echo
+echo "== Heredocs =="
+run_case "<< feeds the following lines into stdin until the delimiter" \
+    'cat << EOF
+line one
+line two
+EOF
+echo after_heredoc' \
+    'line one' \
+    'grep -q "line two" <<< "$ACTUAL_OUTPUT" && grep -q after_heredoc <<< "$ACTUAL_OUTPUT" && ! grep -q EOF <<< "$ACTUAL_OUTPUT"'
+
+export FOO=bar
+run_case "an unquoted heredoc delimiter expands \$VAR in the body" \
+    'cat <<EOF
+value=$FOO
+EOF' \
+    'value=bar' \
+    '! grep -q Error <<< "$ACTUAL_OUTPUT"'
+
+run_case "a quoted heredoc delimiter keeps the body literal" \
+    "cat << 'EOF'
+value=\$FOO
+EOF" \
+    'value=\$FOO'
+
+run_case "<<- strips leading tabs from the body and the delimiter" \
+    "cat <<- EOF
+	indented
+	EOF
+echo after_strip" \
+    ' indented$' \
+    'grep -q after_strip <<< "$ACTUAL_OUTPUT"'
+
+run_case "a heredoc can feed a pipeline" \
+    'cat << EOF | grep keep
+keep me
+drop me
+EOF' \
+    'keep me' \
+    '! grep -q "drop me" <<< "$ACTUAL_OUTPUT"'
+
+run_case "two heredocs on one command are both read, the last one wins" \
+    'cat << A << B
+first
+A
+second
+B
+echo after_both' \
+    'second' \
+    '! grep -q first <<< "$ACTUAL_OUTPUT" && grep -q after_both <<< "$ACTUAL_OUTPUT" && ! grep -q Error <<< "$ACTUAL_OUTPUT"'
+
+echo
+echo "== File descriptor redirections =="
+rm -f "$WORKDIR/err.txt"
+run_case "2> redirects stderr to a file" \
+    'ls this_file_does_not_exist 2> err.txt' \
+    '' \
+    'grep -q this_file_does_not_exist err.txt'
+
+rm -f "$WORKDIR/both.txt"
+run_case "> file 2>&1 sends both streams to the file" \
+    'ls this_file_does_not_exist outfile > both.txt 2>&1' \
+    '' \
+    'grep -q this_file_does_not_exist both.txt && grep -q outfile both.txt'
+
+rm -f "$WORKDIR/piped.txt"
+run_case ">&2 sends stdout to stderr, bypassing the pipe" \
+    'echo to_stderr >&2 | cat > piped.txt' \
+    'to_stderr' \
+    '[ -f piped.txt ] && [ ! -s piped.txt ]'
+
+rm -f "$WORKDIR/order.txt"
+run_case "2>&1 > file keeps stderr on the old stdout (order matters)" \
+    'ls this_file_does_not_exist 2>&1 > order.txt' \
+    'this_file_does_not_exist' \
+    '[ -f order.txt ] && ! grep -q this_file_does_not_exist order.txt'
+
+rm -f "$WORKDIR/clobber.txt"
+run_case ">| writes a file like >" \
+    'echo clobbered >| clobber.txt' \
+    '' \
+    'grep -q clobbered clobber.txt'
+
+echo keep_me > "$WORKDIR/rw.txt"
+run_case "<> opens a file for reading and writing on stdin" \
+    'cat <> rw.txt' \
+    'keep_me'
+
+echo dup_input > "$WORKDIR/dupin.txt"
+run_case "3< file then <&3 reads through a duplicated fd" \
+    'cat 3< dupin.txt <&3' \
+    'dup_input'
+
+run_case "2>&- closes stderr" \
+    'ls this_file_does_not_exist 2>&-' \
+    '' \
+    '! grep -q this_file_does_not_exist <<< "$ACTUAL_OUTPUT"'
+
+run_case "2> /dev/null silences a builtin's error" \
+    'cd this_directory_does_not_exist 2> /dev/null
+echo done_cd' \
+    'done_cd' \
+    '! grep -q "cd:" <<< "$ACTUAL_OUTPUT"'
+
+run_case "2> /dev/null silences command-not-found" \
+    'this_command_does_not_exist 2> /dev/null
+echo done_cnf' \
+    'done_cnf' \
+    '! grep -q this_command_does_not_exist <<< "$ACTUAL_OUTPUT"'
+
+rm -f "$WORKDIR/pwd_err.txt"
+run_case "builtin output and 2>&1 work together in the shell process" \
+    'pwd > pwd_err.txt 2>&1
+echo shell_stdout_restored' \
+    'shell_stdout_restored' \
+    'grep -q "$(basename "$PWD")" pwd_err.txt'
+
+run_case "a digit not followed by a redirect stays a normal argument" \
+    'echo 2 3' \
+    ' 2 3$'
+
+echo
 echo "-----------------------------------"
 echo "Results: ${GREEN}${PASS} passed${NC}, ${RED}${FAIL} failed${NC}"
 

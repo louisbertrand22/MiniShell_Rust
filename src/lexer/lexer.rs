@@ -298,8 +298,95 @@ impl Lexer {
         Token::Word(parts)
     }
 
+    /// Si la position courante est une suite de chiffres immédiatement suivie
+    /// de `<` ou `>` (ex. `2>`), consomme les chiffres et renvoie le numéro de fd.
+    fn try_io_number(&mut self) -> Option<Token> {
+        let digits = self.input[self.position..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        if digits == 0 || !matches!(self.input.get(self.position + digits), Some('<' | '>')) {
+            return None;
+        }
+
+        let text: String = self.input[self.position..self.position + digits].iter().collect();
+        let fd = text.parse().ok()?;
+        self.position += digits;
+        Some(Token::IoNumber(fd))
+    }
+
+    /// Lit le corps brut d'un heredoc: comme dans un double-quote, seul `$`
+    /// (et `\$`, `\\`) est spécial; les quotes y sont du texte ordinaire.
+    pub fn heredoc_parts(body: &str) -> Vec<WordPart> {
+        let mut lexer = Lexer::new(body);
+        let mut parts = Vec::new();
+        let mut buffer = String::new();
+
+        while let Some(c) = lexer.advance() {
+            match c {
+                '\\' => match lexer.peek() {
+                    Some(next @ ('$' | '\\')) => {
+                        buffer.push(next);
+                        lexer.advance();
+                    }
+                    _ => buffer.push('\\'),
+                },
+                '$' => lexer.push_dollar(&mut buffer, &mut parts),
+                c => buffer.push(c),
+            }
+        }
+
+        if !buffer.is_empty() {
+            parts.push(WordPart::Literal(buffer));
+        }
+        parts
+    }
+
+    /// Lit le délimiteur qui suit un `<<`/`<<-` déjà consommé, sans aucune
+    /// expansion: les quotes sont retirées, et leur présence (ou celle d'un
+    /// backslash) est signalée par le booléen, car elle désactive l'expansion
+    /// de `$VAR` dans le corps. `None` si aucun délimiteur ne suit.
+    pub fn read_heredoc_delimiter(&mut self) -> Option<(String, bool)> {
+        self.skip_whitespace();
+        let mut delimiter = String::new();
+        let mut quoted = false;
+        let mut found = false;
+
+        while let Some(c) = self.peek() {
+            match c {
+                '\'' | '"' => {
+                    quoted = true;
+                    found = true;
+                    self.advance();
+                    delimiter.push_str(&self.read_while(|x| x != c));
+                    self.advance(); // quote fermante
+                }
+                '\\' => {
+                    quoted = true;
+                    found = true;
+                    self.advance();
+                    if let Some(next) = self.advance() {
+                        delimiter.push(next);
+                    }
+                }
+                ' ' | '\t' | '\r' | '\n' | ';' | '|' | '&' | '<' | '>' | '(' | ')' => break,
+                _ => {
+                    found = true;
+                    delimiter.push(c);
+                    self.advance();
+                }
+            }
+        }
+
+        found.then_some((delimiter, quoted))
+    }
+
     pub fn next_token(&mut self) -> Token {
         self.skip_whitespace();
+
+        if let Some(token) = self.try_io_number() {
+            return token;
+        }
 
         match self.peek() {
             Some('\'') | Some('"') | Some('$') | Some('\\') => return self.read_word(),
@@ -340,7 +427,7 @@ impl Lexer {
                     }
                     Some('&') => {
                         self.advance();
-                        Token::RedirectOutErr
+                        Token::RedirectDupOut
                     }
                     Some('|') => {
                         self.advance();
@@ -354,7 +441,16 @@ impl Lexer {
                 match self.peek() {
                     Some('&') => {
                         self.advance();
-                        Token::RedirectInErr
+                        Token::RedirectDupIn
+                    }
+                    Some('<') => {
+                        self.advance();
+                        if self.peek() == Some('-') {
+                            self.advance();
+                            Token::HeredocStrip
+                        } else {
+                            Token::Heredoc
+                        }
                     }
                     Some('>') => {
                         self.advance();
