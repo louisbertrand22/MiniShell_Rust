@@ -241,6 +241,24 @@ impl Executor {
             Command::Pipeline(commands) => Self::execute_pipeline(commands),
             Command::Loop { condition, body, until } => Self::execute_loop(*condition, *body, until),
             Command::For { var, words, body } => Self::execute_for(var, words, *body),
+            Command::Redirected { command, redirects } => {
+                let prepared = Self::prepare_redirects(&redirects).inspect_err(|_| Self::set_last_status(1))?;
+                // Appliquées sur les fds du shell lui-même: les commandes externes
+                // lancées dans la structure en héritent, les builtins aussi.
+                Self::with_redirects_in_shell(&prepared, || Self::execute(*command))
+                    .inspect_err(|_| Self::set_last_status(1))?
+            }
+            Command::Not(command) => {
+                // Le message d'échec de la commande niée n'a plus lieu d'être:
+                // son échec est justement le cas attendu.
+                if Self::execute(*command).is_ok() {
+                    Self::set_last_status(1);
+                    Err(String::new())
+                } else {
+                    Self::set_last_status(0);
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -304,17 +322,20 @@ impl Executor {
         Ok((fds[0], fds[1]))
     }
 
-    /// Exécute un builtin comme étage de pipeline en le forkant: l'enfant
-    /// branche `stdin_fd`/`stdout_fd` sur ses fds 0/1, applique ses propres
-    /// redirections, puis lance le builtin directement (sans exec), avant de
-    /// quitter avec son code de sortie.
-    fn fork_builtin(
-        name: &str,
-        args: &[String],
-        prepared: &PreparedRedirects,
+    /// Exécute un étage de pipeline dans une copie forkée du shell (sans
+    /// exec): l'enfant branche `stdin_fd`/`stdout_fd` sur ses fds 0/1, ferme
+    /// `extra_fd` (le bout de lecture du pipe suivant, qui ne le concerne pas),
+    /// lance `run`, puis quitte avec le code renvoyé. Sert aux builtins et aux
+    /// structures (`if`, boucles, ...), dont les effets (cd, export, ...)
+    /// restent ainsi confinés à l'enfant, comme le subshell d'un vrai shell.
+    fn fork_stage(
         stdin_fd: Option<RawFd>,
         stdout_fd: Option<RawFd>,
+        extra_fd: Option<RawFd>,
+        run: impl FnOnce() -> i32,
     ) -> Result<libc::pid_t, String> {
+        // Sinon un texte encore en buffer serait écrit deux fois (parent + enfant).
+        io::stdout().flush().ok();
         let pid = unsafe { libc::fork() };
 
         if pid < 0 {
@@ -327,35 +348,63 @@ impl Executor {
 
         // Process enfant: à partir d'ici on ne revient jamais dans execute_pipeline.
         signals::reset_for_child();
-        if let Some(fd) = stdin_fd {
-            unsafe {
-                libc::dup2(fd, 0);
-                libc::close(fd);
-            }
-        }
-        if let Some(fd) = stdout_fd {
-            unsafe {
-                libc::dup2(fd, 1);
-                libc::close(fd);
-            }
-        }
-
-        let code = match Self::apply_fd_actions(&prepared.actions) {
-            Err(e) => {
-                Self::report_error(&format!("{}: {}", name, e));
-                1
-            }
-            Ok(()) => match Self::run_builtin(name, args) {
-                Ok(()) => 0,
-                Err(e) => {
-                    Self::report_error(&e);
-                    1
+        for (fd, target) in [(stdin_fd, 0), (stdout_fd, 1)] {
+            if let Some(fd) = fd {
+                unsafe {
+                    libc::dup2(fd, target);
+                    libc::close(fd);
                 }
-            },
-        };
+            }
+        }
+        if let Some(fd) = extra_fd {
+            unsafe { libc::close(fd) };
+        }
 
+        let code = run();
         io::stdout().flush().ok();
         std::process::exit(code);
+    }
+
+    /// Corps d'un builtin forké: ses redirections, puis le builtin lui-même.
+    fn run_forked_builtin(name: &str, args: &[String], prepared: &PreparedRedirects) -> i32 {
+        let result = Self::apply_fd_actions(&prepared.actions)
+            .map_err(|e| format!("{name}: {e}"))
+            .and_then(|()| Self::run_builtin(name, args));
+        match result {
+            Ok(()) => 0,
+            Err(e) => {
+                Self::report_error(&e);
+                1
+            }
+        }
+    }
+
+    /// Corps d'une structure forkée: l'executor normal, dans l'enfant. Le code
+    /// de sortie est celui de sa dernière commande, comme pour `$?`.
+    fn run_forked_command(command: Command) -> i32 {
+        match Self::execute(command) {
+            Ok(()) => 0,
+            Err(e) => {
+                if !e.is_empty() {
+                    Self::report_error(&e);
+                }
+                // Une erreur sans statut enregistré (ex. erreur de redirection
+                // déjà comptée) ne doit jamais devenir un succès.
+                match Self::last_status() {
+                    0 => 1,
+                    code => code,
+                }
+            }
+        }
+    }
+
+    /// Ferme les copies parent des fds passés à un étage forké: l'enfant en a
+    /// fait les siennes via dup2, et sans exec, FD_CLOEXEC ne joue pas ici.
+    /// Indispensable pour qu'un lecteur voie la fin de fichier du pipe.
+    fn close_fds(fds: [Option<RawFd>; 2]) {
+        for fd in fds.into_iter().flatten() {
+            unsafe { libc::close(fd) };
+        }
     }
 
     fn execute_pipeline(commands: Vec<Command>) -> Result<(), String> {
@@ -364,16 +413,6 @@ impl Executor {
         let mut prev_read: Option<RawFd> = None;
 
         for (i, command) in commands.into_iter().enumerate() {
-            let simple_cmd = match command {
-                Command::Simple(simple_cmd) => simple_cmd,
-                _ => return Err("Only simple commands are supported in pipelines for now".to_string()),
-            };
-
-            let name = Self::expand(&simple_cmd.name);
-            let args: Vec<String> = simple_cmd.args.iter().map(Self::expand).collect();
-
-            let prepared = Self::prepare_redirects(&simple_cmd.redirects)?;
-
             let (next_read, write_end) = if i + 1 < count {
                 let (r, w) = Self::create_pipe()?;
                 (Some(r), Some(w))
@@ -381,19 +420,32 @@ impl Executor {
                 (None, None)
             };
 
-            if Self::is_builtin(&name) {
-                let pid = Self::fork_builtin(&name, &args, &prepared, prev_read, write_end)?;
-                children.push(PipelineChild::Forked(pid));
+            let simple_cmd = match command {
+                Command::Simple(simple_cmd) => simple_cmd,
+                compound => {
+                    // Structure (if, boucle, ...): tout l'executor tourne dans l'enfant.
+                    let pid = Self::fork_stage(prev_read, write_end, next_read, || Self::run_forked_command(compound))?;
+                    children.push(PipelineChild::Forked(pid));
+                    Self::close_fds([prev_read, write_end]);
+                    prev_read = next_read;
+                    continue;
+                }
+            };
 
-                // Le parent n'a plus besoin de ses copies: l'enfant en a fait les
-                // siennes via dup2. Sans exec côté enfant, FD_CLOEXEC ne joue pas
-                // ici, donc c'est à nous de fermer ces fds explicitement.
-                if let Some(fd) = prev_read {
-                    unsafe { libc::close(fd) };
-                }
-                if let Some(fd) = write_end {
-                    unsafe { libc::close(fd) };
-                }
+            let name = Self::expand(&simple_cmd.name);
+            let args: Vec<String> = simple_cmd.args.iter().map(Self::expand).collect();
+
+            let prepared = Self::prepare_redirects(&simple_cmd.redirects).inspect_err(|_| {
+                Self::close_fds([prev_read, write_end]);
+                Self::close_fds([next_read, None]);
+            })?;
+
+            if Self::is_builtin(&name) {
+                let pid = Self::fork_stage(prev_read, write_end, next_read, || {
+                    Self::run_forked_builtin(&name, &args, &prepared)
+                })?;
+                children.push(PipelineChild::Forked(pid));
+                Self::close_fds([prev_read, write_end]);
             } else {
                 let stdin = match prev_read {
                     Some(fd) => unsafe { Stdio::from_raw_fd(fd) },

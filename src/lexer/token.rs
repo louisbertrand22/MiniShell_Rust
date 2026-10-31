@@ -15,15 +15,15 @@ pub enum Token {
     Or,
     For,
     In,
-    Neg,
     Pipeline,
+    /// `!` nu en tête de pipeline (négation); ailleurs, le parser le relit
+    /// comme le mot `!` (ex. `[ ! -f x ]`).
+    Bang,
 
     /// A word, possibly made of several parts glued together with no
     /// whitespace in between (e.g. `pre"mid"$VARpost` is one `Word` with
     /// three parts).
     Word(Vec<WordPart>),
-
-    Assign,
 
     /// Numéro de fd collé juste devant un opérateur de redirection
     /// (le `2` de `2>file`, le `3` de `3<&0`, ...).

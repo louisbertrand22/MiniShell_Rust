@@ -8,21 +8,19 @@ use super::token::{ParamOp, Token, WordPart};
 fn is_extra_word_punct(c: char) -> bool {
     matches!(
         c,
-        '_' | '.' | '/' | '-' | '[' | ']' | '#' | '%' | '^' | '*' | '+' | '~' | '@' | ':' | ',' | '?' | '`'
+        '_' | '.' | '/' | '-' | '[' | ']' | '#' | '%' | '^' | '*' | '+' | '~' | '@' | ':' | ',' | '?' | '`' | '=' | '!'
     )
 }
 
 /// Caractères pouvant démarrer une portion nue (non quotée) d'un mot.
+/// `=` et `!` en font partie: `[ a = b ]`, `[ ! -f x ]`, `NAME=value`.
 fn is_word_start(c: char) -> bool {
     c.is_alphanumeric() || is_extra_word_punct(c)
 }
 
-/// Caractères pouvant continuer une portion nue déjà démarrée. `=` n'est
-/// autorisé qu'ici (pas comme premier caractère) pour garder des
-/// assignations comme "NAME=value" en un seul mot, sans faire de '=' seul
-/// un caractère de mot valide.
+/// Caractères pouvant continuer une portion nue déjà démarrée.
 fn is_word_continue(c: char) -> bool {
-    c.is_alphanumeric() || is_extra_word_punct(c) || c == '='
+    is_word_start(c)
 }
 
 fn keyword_token(word: &str) -> Option<Token> {
@@ -38,6 +36,7 @@ fn keyword_token(word: &str) -> Option<Token> {
         "done" => Token::Done,
         "for" => Token::For,
         "in" => Token::In,
+        "!" => Token::Bang,
         _ => return None,
     })
 }
@@ -416,8 +415,6 @@ impl Lexer {
                 }
             }
 
-            Some('!') => Token::Neg,
-            Some('=') => Token::Assign,
 
             Some('>') => {
                 match self.peek() {

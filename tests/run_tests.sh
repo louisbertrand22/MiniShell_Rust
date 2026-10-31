@@ -237,6 +237,15 @@ run_case "[ ... ] invokes the real test binary" \
     '[ -f testfile ] && echo test_worked' \
     'test_worked'
 
+run_case "a lone = is a word (string comparison with [ ])" \
+    '[ abc = abc ] && echo equal_worked; echo =start' \
+    'equal_worked' \
+    'grep -qx "=start" <<< "$ACTUAL_OUTPUT"'
+
+run_case "a lone ! is a word (negation with [ ])" \
+    '[ ! -f nope ] && echo negation_worked' \
+    'negation_worked'
+
 run_case "an unquoted backslash escapes the next character, keeping the word open" \
     'echo hello\ world' \
     'hello world$'
@@ -326,6 +335,113 @@ run_case "exit inside a pipeline only kills that stage, not the whole shell" \
     'exit 3 | true
 echo still_alive' \
     'still_alive'
+
+echo
+echo "== Compound commands inside pipelines =="
+run_case "a for loop's output can be piped" \
+    'for i in a b c; do echo $i; done | tr abc XYZ | tr -d "\n"; echo' \
+    ' XYZ$' \
+    '! grep -q Error <<< "$ACTUAL_OUTPUT"'
+
+run_case "an if's output can be piped" \
+    'if true; then echo yes; else echo no; fi | tr y Y' \
+    ' Yes$' \
+    '! grep -q Error <<< "$ACTUAL_OUTPUT"'
+
+run_case "a compound command can read from a pipe" \
+    'echo piped_in | if true; then tr a-z A-Z; fi' \
+    'PIPED_IN' \
+    '! grep -q Error <<< "$ACTUAL_OUTPUT"'
+
+run_case "a compound command can sit in the middle of a pipeline" \
+    'printf "1\n2\n3\n" | while false; do :; done | wc -l; echo middle_ok' \
+    'middle_ok' \
+    '! grep -q Error <<< "$ACTUAL_OUTPUT"'
+
+run_case "a while loop in a pipeline stage runs its body" \
+    'export N=x; until [ $N = xxx ]; do echo $N; export N=x$N; done | wc -l' \
+    ' *2$' \
+    '! grep -q Error <<< "$ACTUAL_OUTPUT"'
+
+run_case "a pipeline nested inside a piped compound command" \
+    'if true; then echo abc | tr a A; fi | tr b B' \
+    ' ABc$' \
+    '! grep -q Error <<< "$ACTUAL_OUTPUT"'
+
+run_case "state changes inside a piped compound command do not leak" \
+    'true | for i in 1; do export LEAK=oops; cd subdir; done
+echo LEAK=[$LEAK]; pwd' \
+    'LEAK=\[\]' \
+    '! grep -q "subdir$" <<< "$ACTUAL_OUTPUT"'
+
+run_case "the exit status of a piped compound command is its last command's" \
+    'true | if true; then exit 4; fi; echo status=$?' \
+    'status=4'
+
+echo
+echo "== Redirections on compound commands =="
+run_case "a for loop's output goes to a file" \
+    'for i in 1 2 3; do echo line$i; done > loop_out.txt' \
+    '' \
+    '[[ "$(command cat loop_out.txt)" == "$(printf "line1\nline2\nline3")" ]]'
+
+run_case "the shell's stdout is restored after a redirected compound command" \
+    'if true; then echo inside; fi > restored.txt; echo outside' \
+    ' outside$' \
+    '! grep -q inside <<< "$ACTUAL_OUTPUT" && grep -qx inside restored.txt'
+
+run_case ">> appends a compound command's output" \
+    'for i in a; do echo first; done > app.txt; for i in b; do echo second; done >> app.txt' \
+    '' \
+    '[[ "$(command cat app.txt)" == "$(printf "first\nsecond")" ]]'
+
+run_case "a compound command reads from a < file" \
+    'printf "abc\n" > comp_in.txt; if true; then tr a-z A-Z; fi < comp_in.txt' \
+    'ABC'
+
+run_case "a heredoc feeds a compound command" \
+    'for i in 1; do tr a-z A-Z; done << EOF
+heredoc_body
+EOF' \
+    'HEREDOC_BODY'
+
+run_case "stderr of a whole compound command can be redirected" \
+    'if true; then echo to_err >&2; echo to_out; fi 2> comp_err.txt' \
+    'to_out' \
+    'grep -qx to_err comp_err.txt && ! grep -q to_err <<< "$ACTUAL_OUTPUT"'
+
+run_case "a redirected compound command inside a pipeline" \
+    'if true; then echo abc >&2; fi 2>&1 | tr a A' \
+    'Abc'
+
+run_case "a failed redirection skips the compound command (status 1)" \
+    'if true; then echo should_not_run; fi < missing_file; echo status=$?' \
+    'status=1' \
+    '! grep -q should_not_run <<< "$ACTUAL_OUTPUT"'
+
+echo
+echo "== Negation (!) =="
+run_case "! turns a failure into success" \
+    '! false && echo negated_ok' \
+    'negated_ok' \
+    '! grep -q Error <<< "$ACTUAL_OUTPUT"'
+
+run_case "! turns a success into failure" \
+    '! true; echo status=$?' \
+    'status=1' \
+    '! grep -q Error <<< "$ACTUAL_OUTPUT"'
+
+run_case "! negates a whole pipeline" \
+    '! echo abc | grep -q zzz; echo status=$?' \
+    'status=0'
+
+run_case "! works in an if condition" \
+    'if ! [ -f nope ]; then echo absent; fi' \
+    'absent'
+
+run_case "a quoted ! is an ordinary word, not negation" \
+    "echo '!' x" \
+    ' ! x$'
 
 echo
 echo "== Parameter expansion (\${VAR} and friends) =="

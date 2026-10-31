@@ -100,8 +100,13 @@ impl Parser {
         Ok(left)
     }
 
-    /// Gère les pipelines: command ( '|' command )*
+    /// Gère les pipelines: ['!'] command ( '|' command )*
     fn parse_pipeline(&mut self) -> Result<Command, String> {
+        if self.current_token == Token::Bang {
+            self.advance(); // Consomme '!': nie le pipeline entier
+            return Ok(Command::Not(Box::new(self.parse_pipeline()?)));
+        }
+
         let mut commands = vec![self.parse_command()?];
 
         while self.current_token == Token::Pipeline {
@@ -118,13 +123,24 @@ impl Parser {
 
     /// Gère les commandes de base (if, while, until, for, simple commands, subshells)
     fn parse_command(&mut self) -> Result<Command, String> {
-        match self.current_token {
-            Token::If => self.parse_if(),
-            Token::While => self.parse_loop(false),
-            Token::Until => self.parse_loop(true),
-            Token::For => self.parse_for(),
-            Token::Word(_) => Ok(Command::Simple(self.parse_simple_command()?)),
-            _ => Err(format!("Unexpected token in command: {:?}", self.current_token)),
+        let compound = match self.current_token {
+            Token::If => self.parse_if()?,
+            Token::While => self.parse_loop(false)?,
+            Token::Until => self.parse_loop(true)?,
+            Token::For => self.parse_for()?,
+            Token::Word(_) => return Ok(Command::Simple(self.parse_simple_command()?)),
+            _ => return Err(format!("Unexpected token in command: {:?}", self.current_token)),
+        };
+
+        // Redirections après le mot-clé fermant: `for ... done > f`.
+        let mut redirects = Vec::new();
+        while Self::starts_redirect(&self.current_token) {
+            redirects.push(self.parse_redirect()?);
+        }
+        if redirects.is_empty() {
+            Ok(compound)
+        } else {
+            Ok(Command::Redirected { command: Box::new(compound), redirects })
         }
     }
 
@@ -136,7 +152,12 @@ impl Parser {
     }
 
     /// Consomme le token courant s'il forme un mot, sans avancer sinon.
+    /// Un `!` hors tête de pipeline est un mot ordinaire (`[ ! -f x ]`).
     fn take_word(&mut self) -> Option<Word> {
+        if self.current_token == Token::Bang {
+            self.advance();
+            return Some(Word::Literal("!".to_string()));
+        }
         if !matches!(self.current_token, Token::Word(_)) {
             return None;
         }

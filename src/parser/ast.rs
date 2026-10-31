@@ -27,6 +27,14 @@ pub enum Command {
         words: Vec<Word>,
         body: Box<Command>,
     },
+    /// Une structure suivie de redirections (`for ... done > f`, `if ... fi < f`):
+    /// elles s'appliquent à tout ce qui s'exécute à l'intérieur.
+    Redirected {
+        command: Box<Command>,
+        redirects: Vec<Redirect>,
+    },
+    /// `! pipeline`: inverse le statut (succès <-> échec).
+    Not(Box<Command>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
